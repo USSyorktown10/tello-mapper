@@ -319,6 +319,8 @@ class LiteMono(nn.Module):
                 self.dilation = [[1, 2, 3], [1, 2, 3], [1, 2, 3, 2, 4, 6]]
             elif height == 320 and width == 1024:
                 self.dilation = [[1, 2, 5], [1, 2, 5], [1, 2, 5, 2, 4, 10]]
+            elif height == 96 and width == 320:
+                self.dilation = [[1, 2, 3], [1, 2, 3], [1, 2, 3, 2, 4, 6]]
 
         elif model == 'lite-mono-tiny':
             self.num_ch_enc = np.array([32, 64, 128])

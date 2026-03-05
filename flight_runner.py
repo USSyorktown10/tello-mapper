@@ -1,413 +1,385 @@
-"""Simple flight runner integrating camera detections, mapping, planning, and
-visualization.
-
-Run in simulation mode (no drone) for safe development. When a Tello is
-connected, set `USE_SIM=False` to run with real hardware.
-
-This is a conservative demo: for truly accurate wall positions, add a range
-sensor or use known markers and stereo/depth cameras.
-"""
-
 import sys
 import cv2
 import time
+import threading
 import numpy as np
 from mapper import Mapper
-from planner import astar
+from planner import find_frontier, plan_path_to_target, find_all_frontiers
 import torch
 import os
-import matplotlib as mpl
-import matplotlib.cm as cm
 
+# --- CONFIGURATION ---
+USE_SIM = True          # False = Real Tello
+TEST_MODE = False         # True = Camera ON, Motors OFF (Good for tuning)
+
+DEPTH_EVERY_N = 3       
+DEPTH_DOWNSAMPLE = 4
+CONFIG_FILE = "depth_config.txt"
+
+# Load saved scale or default to 5.0
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r") as f:
+        try:
+            DEPTH_SCALE = float(f.read().strip())
+            print(f"Loaded saved scale: {DEPTH_SCALE}")
+        except:
+            DEPTH_SCALE = 5.0
+else:
+    DEPTH_SCALE = 5.0
+
+torch.set_num_threads(2)
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LITEMONO_DIR = os.path.join(ROOT, "Lite-Mono")
 if LITEMONO_DIR not in sys.path:
     sys.path.insert(0, LITEMONO_DIR)
 
-import networks  # this is Lite-Mono's networks module inside Lite-Mono/
-from layers import disp_to_depth  # Lite-Mono's layers.py
+import networks
+from layers import disp_to_depth
 
+# --- CUSTOM VIDEO READER (Bypasses 'av' library) ---
+class BackgroundFrameRead:
+    """
+    Reads frames from Tello UDP stream using OpenCV directly.
+    This bypasses the 'av' library crash issues.
+    """
+    def __init__(self, source="udp://@0.0.0.0:11111"):
+        self.cap = cv2.VideoCapture(source)
+        self.frame = None
+        self.stopped = False
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.daemon = True
+        
+    def start(self):
+        self.thread.start()
+        return self
 
-# paths to the weights you said you have
-ENCODER_PATH = "weights/lite-mono-small-640x192/encoder.pth"
-DEPTH_PATH = "weights/lite-mono-small-640x192/depth.pth"
+    def update(self):
+        while not self.stopped:
+            if not self.cap.isOpened():
+                time.sleep(0.1)
+                continue
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame = frame
+            else:
+                time.sleep(0.01) # preventing busy wait on failure
 
-
-# Point to repo root for Lite-Mono-style networks + layers
-ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-# Set to True to use your webcam (safe). Set to False to use a real Tello.
-USE_SIM = True
-
+    def stop(self):
+        self.stopped = True
+        self.thread.join()
+        self.cap.release()
 
 class DummyDrone:
     def __init__(self):
-        self.x = 0.0
-        self.y = 0.0
-        self.theta = 0.0
-        self._landed = True
-
-    def takeoff(self):
-        print("sim: takeoff")
-        self._landed = False
-
-    def land(self):
-        print("sim: land")
-        self._landed = True
-
-    @property
-    def landed(self):
-        return self._landed
-
-    def get_height(self):
-        # return a small integer height when landed, larger when flying
-        return 0 if self._landed else 50
-
-    def streamoff(self):
-        # noop for dummy
-        return
-
-    def send_rc_control(self, lr, fb, ud, yv):
-        # lr: left/right, fb: forward/back in cm/s. We integrate a small step
-        dt = 0.5
-        dx = fb / 100.0 * dt
-        dy = lr / 100.0 * dt
-        self.x += dx
-        self.y += dy
+        self.x = 0.0; self.y = 0.0; self.theta = 0.0
+    def takeoff(self): pass
+    def land(self): pass
+    def send_rc_control(self, lr, fb, ud, yv): pass
+    def get_height(self): return 0
+    def get_battery(self): return 100
 
 
-def detect_colored_objects(frame):
-    # simple bright detection used as placeholder for walls/objects
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower = np.array([0, 0, 180])
-    upper = np.array([180, 60, 255])
-    mask = cv2.inRange(hsv, lower, upper)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < 200:
-            continue
-        x, y, w, h = cv2.boundingRect(cnt)
-        boxes.append((x, y, w, h))
-    return boxes
-
-
-def wait_for_landed(drone, timeout=8.0):
-    """Send land and wait until drone reports landed or timeout."""
-    try:
-        print('wait_for_landed: sending land')
-        drone.land()
-    except Exception as e:
-        print('wait_for_landed: error sending land:', e)
-
-    start = time.time()
-    while time.time() - start < timeout:
-        # DummyDrone exposes a 'landed' property; Tello doesn't but has get_height
-        landed = getattr(drone, 'landed', None)
-        if landed is True:
-            print('wait_for_landed: drone reports landed')
-            return True
-        # try Tello height
-        try:
-            get_height = getattr(drone, 'get_height', None)
-            if callable(get_height):
-                height = drone.get_height()
-                print('wait_for_landed: tello height', height)
-                if height is not None and int(height) <= 5:
+class FlightController:
+    """Manages autonomous flight: planning, obstacle avoidance, waypoint following."""
+    
+    def __init__(self, drone, mapper, planner_module):
+        self.drone = drone
+        self.mapper = mapper
+        self.planner = planner_module
+        self.state = "exploring"  # exploring, planning, moving, hovering, landing
+        self.target_frontier = None
+        self.current_path = []
+        self.path_index = 0
+        self.stuck_counter = 0
+        self.last_pos = (0, 0)
+        
+    def update(self, occupancy_grid):
+        """Main update loop for autonomous flight."""
+        drone_cell = self.mapper.get_drone_cell()
+        
+        if self.state == "exploring":
+            # Find nearest frontier
+            self.target_frontier = self.planner.find_frontier(
+                occupancy_grid, drone_cell, min_distance=5, max_distance=50
+            )
+            if self.target_frontier:
+                self.state = "planning"
+            else:
+                # No frontier found - exploration complete or trapped
+                print("No frontiers found. Exploration complete or area fully mapped.")
+                self.state = "landing"
+        
+        elif self.state == "planning":
+            # Plan path to frontier
+            if self.target_frontier:
+                self.current_path = self.planner.plan_path_to_target(
+                    occupancy_grid, drone_cell, self.target_frontier
+                )
+                if len(self.current_path) > 1:
+                    self.path_index = 0
+                    self.state = "moving"
+                    print(f"Planned path with {len(self.current_path)} waypoints")
+                else:
+                    # Can't reach frontier, try another
+                    print("No path to frontier, exploring again")
+                    self.state = "exploring"
+        
+        elif self.state == "moving":
+            # Follow waypoint path
+            if self.current_path and self.path_index < len(self.current_path):
+                target_cell = self.current_path[self.path_index]
+                self._move_to_waypoint(target_cell)
+                
+                # Check if reached waypoint (within 2 cells)
+                dist = abs(drone_cell[0] - target_cell[0]) + abs(drone_cell[1] - target_cell[1])
+                if dist < 2:
+                    self.path_index += 1
+                    self.stuck_counter = 0
+                else:
+                    self.stuck_counter += 1
+                    if self.stuck_counter > 30:  # Stuck for ~1 second
+                        print("Stuck on path, replanning...")
+                        self.state = "exploring"
+            else:
+                # Path complete, return to exploring
+                self.state = "exploring"
+        
+        elif self.state == "hovering":
+            # Check if obstacle cleared
+            self.drone.send_rc_control(0, 0, 0, 0)  # Hover
+            if not self._check_obstacle_ahead(occupancy_grid, drone_cell):
+                self.state = "moving"
+        
+        elif self.state == "landing":
+            self.drone.land()
+    
+    def _move_to_waypoint(self, target_cell):
+        """Send movement commands to reach target cell."""
+        drone_cell = self.mapper.get_drone_cell()
+        dx = target_cell[0] - drone_cell[0]
+        dy = target_cell[1] - drone_cell[1]
+        
+        # Convert cell difference to movement commands
+        # Tello RC control: lr (-100:right, 100:left), fb (-100:back, 100:forward)
+        #                   ud (-100:down, 100:up), yv (-100:ccw, 100:cw)
+        
+        # Simple proportional control
+        speed = 30  # 1-100 range
+        
+        if abs(dx) > abs(dy):
+            # Move left/right
+            fb = 0
+            lr = speed if dx > 0 else -speed
+        else:
+            # Move forward/backward
+            lr = 0
+            fb = speed if dy > 0 else -speed
+        
+        # Maintain altitude
+        ud = 0
+        
+        # Simple yaw (rotation to face direction)
+        yv = 0
+        
+        if not TEST_MODE:
+            self.drone.send_rc_control(lr, fb, ud, yv)
+    
+    def _check_obstacle_ahead(self, occupancy_grid, drone_cell, check_distance=5):
+        """Check if obstacle is ahead of drone."""
+        cx, cy = drone_cell
+        
+        # Check in front of drone (simple forward check)
+        for d in range(1, check_distance):
+            check_cell = (cx, cy + d)
+            if (0 <= check_cell[0] < occupancy_grid.shape[1] and 
+                0 <= check_cell[1] < occupancy_grid.shape[0]):
+                if occupancy_grid[check_cell[1], check_cell[0]] > 0.7:  # Occupied
                     return True
-        except Exception:
-            pass
-        time.sleep(0.2)
-    print('wait_for_landed: timeout')
-    return False
+        return False
+
+def draw_hud(img, center_dist, scale, mode_msg, flight_state=""):
+    h, w = img.shape[:2]
+    cx, cy = w // 2, h // 2
+    # Crosshair
+    cv2.line(img, (cx - 10, cy), (cx + 10, cy), (0, 255, 0), 1)
+    cv2.line(img, (cx, cy - 10), (cx, cy + 10), (0, 255, 0), 1)
+    # Text
+    dist_txt = f"Dist: {center_dist:.2f} m" if center_dist else "Dist: --"
+    cv2.putText(img, dist_txt, (cx + 15, cy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    # Info Bar
+    status = "TEST MODE (No Fly)" if TEST_MODE else "FLYING"
+    flight_txt = f" | State: {flight_state}" if flight_state else ""
+    cv2.rectangle(img, (0, 0), (w, 40), (0, 0, 0), -1)
+    cv2.putText(img, f"Scale: {scale:.1f} ([/]) | {status}{flight_txt}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
 
 def main():
-    print("Mapping")
-    mapper = Mapper(size_m=6.0, resolution=0.05)
+    global DEPTH_SCALE
+    mapper = Mapper(size_m=8.0, resolution=0.1)
+    
+    cap = None          # For Webcam
+    frame_reader = None # For Tello
 
-    cap = None
-    frame_read = None
-
+    # --- DRONE SETUP ---
     if USE_SIM:
         drone = DummyDrone()
-        cap = cv2.VideoCapture(0)  # use webcam for sim
-        if not cap.isOpened():
-            print("ERROR: could not open webcam for simulation")
-            return
+        cap = cv2.VideoCapture(0)
     else:
         from djitellopy import Tello
         drone = Tello()
-        drone.connect()
-        drone.streamon()
-        frame_read = drone.get_frame_read()
+        try:
+            drone.connect()
+            drone.streamon()
+            print(f"Battery: {drone.get_battery()}%")
+            
+            # Use Custom Reader instead of drone.get_frame_read()
+            print("Starting Custom OpenCV Video Thread...")
+            frame_reader = BackgroundFrameRead().start()
+            time.sleep(2) # Warmup
+        except Exception as e:
+            print(f"Connection Error: {e}")
+            return
 
-    print("taking off")
-    drone.takeoff()
-    time.sleep(1)
+    # --- SAFETY CHECK ---
+    if not TEST_MODE and not USE_SIM:
+        print("Taking off in 3 seconds...")
+        time.sleep(3)
+        drone.takeoff()
+    else:
+        print("TEST MODE: Motors disabled. Running camera & AI only.")
 
-    plan = []
-    plan_index = 0
+    # --- AI SETUP ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weights_folder = os.path.join(ROOT, "weights", "lite-mono-small-640x192")
+    encoder_path = os.path.join(weights_folder, "encoder.pth")
+    decoder_path = os.path.join(weights_folder, "depth.pth")
+
+    encoder = networks.LiteMono(model="lite-mono-small", height=96, width=320)
+    encoder.load_state_dict({k: v for k, v in torch.load(encoder_path, map_location=device).items() if k in encoder.state_dict()})
+    encoder.to(device).eval()
+
+    depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(3))
+    depth_decoder.load_state_dict({k: v for k, v in torch.load(decoder_path, map_location=device).items() if k in depth_decoder.state_dict()})
+    depth_decoder.to(device).eval()
+
+    # --- MAIN LOOP ---
     running = True
-    land_requested = False
+    frame_count = 0
+    prev_depth = None
+    
+    # Initialize flight controller (will be None if USE_SIM)
+    flight_controller = None
+    auto_flight = False  # Toggle with 'a' key
+
     try:
-        loop = 0
-
-        # Load Lite-Mono from local weights (preferred for depth)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Paths to the weights you used with test_simple.py
-        weights_folder = os.path.join(ROOT, "weights", "lite-mono-small-640x192")
-        encoder_path = os.path.join(weights_folder, "encoder.pth")
-        decoder_path = os.path.join(weights_folder, "depth.pth")
-
-        print("Loading Lite-Mono-small from", weights_folder)
-        encoder_dict = torch.load(encoder_path, map_location=device)
-        decoder_dict = torch.load(decoder_path, map_location=device)
-
-        feed_height = encoder_dict["height"]
-        feed_width = encoder_dict["width"]
-
-        # Build encoder/decoder exactly like test_simple.py
-        encoder = networks.LiteMono(
-            model="lite-mono-small",
-            height=feed_height,
-            width=feed_width,
-        )
-        model_dict = encoder.state_dict()
-        encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
-        encoder.to(device).eval()
-
-        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(3))
-        depth_model_dict = depth_decoder.state_dict()
-        depth_decoder.load_state_dict({k: v for k, v in decoder_dict.items() if k in depth_model_dict})
-        depth_decoder.to(device).eval()
-
-        print("Lite-Mono-small ready for inference")
-
         while running:
-            loop += 1
-            # Load encoder and decoder similar to evaluate_depth.py in Lite-Mono[web:36
+            # 1. Get Frame
+            frame = None
             if USE_SIM:
-                # if webcam not available, use a dummy black frame so mapping still runs
-                if cap is None or not cap.isOpened():
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    boxes = []
-                else:
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                        boxes = []
-                    else:
-                        boxes = detect_colored_objects(frame)
+                ret, frame = cap.read()
+                if not ret: continue
             else:
-                # frame_read may be None or not yet providing frames; guard access
-                if frame_read is None:
-                    # frame thread not initialized yet
+                if frame_reader is None or frame_reader.frame is None:
                     time.sleep(0.01)
                     continue
-                frame = getattr(frame_read, 'frame', None)
-                if frame is None:
-                    # frame not ready yet
-                    time.sleep(0.01)
-                    continue
-                boxes = detect_colored_objects(frame)
+                frame = frame_reader.frame.copy()
 
-            # Convert BGR frame to RGB and resize to the trained input size
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w = rgb.shape[:2]
-
-            # Resize to (feed_width, feed_height) from the weights
-            rgb_resized = cv2.resize(rgb, (feed_width, feed_height))
-            input_tensor = torch.from_numpy(rgb_resized).float() / 255.0
+            # 2. Crop & Resize (Correcting Aspect Ratio)
+            orig_h, orig_w = frame.shape[:2]
+            target_aspect = 320 / 96
+            crop_h = int(orig_w / target_aspect)
+            cy = orig_h // 2
+            crop_frame = frame[max(0, cy - crop_h // 2):min(orig_h, cy + crop_h // 2), 0:orig_w]
+            
+            input_img = cv2.resize(crop_frame, (320, 96))
+            input_tensor = torch.from_numpy(cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)).float() / 255.0
             input_tensor = input_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
 
-            with torch.no_grad():
-                features = encoder(input_tensor)
-                outputs = depth_decoder(features)
-                disp = outputs[("disp", 0)]  # same as in test_simple.py
+            frame_count += 1
+            center_dist_m = None
 
-                # Convert disparity to depth using the helper
-                scaled_disp, depth_tensor = disp_to_depth(disp, 0.1, 100.0)
-                depth = depth_tensor[0, 0].cpu().numpy()
-                # depth is in meters-ish at (feed_height, feed_width)
-                depth = cv2.resize(depth, (w, h))
-
-            if depth is not None:
-                mapper.process_depth_map(depth, camera_fov_deg=78.0, max_range_m=5.0, downsample=6)
+            # 3. Inference
+            if frame_count % DEPTH_EVERY_N == 0:
+                with torch.no_grad():
+                    features = encoder(input_tensor)
+                    outputs = depth_decoder(features)
+                    disp = outputs[("disp", 0)]
+                    _, depth_out = disp_to_depth(disp, 0.1, 100.0)
+                    depth_npy = depth_out.cpu().squeeze().numpy()
+                    depth_npy = cv2.medianBlur(depth_npy, 5)
+                    
+                    prev_depth = depth_npy * DEPTH_SCALE # Apply Scale
             
+            depth = prev_depth
+
             if depth is not None:
-                # Depth is in meters; you can clip to a max range for visualization
-                d_vis = depth.copy()
-                d_vis = np.clip(d_vis, 0.1, 10.0)
+                mapper.process_depth_map(depth, downsample=DEPTH_DOWNSAMPLE)
+                
+                # Get Center Distance for HUD
+                h_d, w_d = depth.shape
+                mid_patch = depth[h_d//2-2:h_d//2+2, w_d//2-2:w_d//2+2]
+                if mid_patch.size > 0:
+                    center_dist_m = np.median(mid_patch)
 
-                # Normalize to 0–1
-                d_norm = (d_vis - d_vis.min()) / (d_vis.max() - d_vis.min() + 1e-8)
+            # 4. Visualization
+            if depth is not None:
+                d_vis = np.clip(depth, 0.0, 5.0)
+                d_norm = (d_vis / 5.0 * 255).astype(np.uint8)
+                d_color = cv2.applyColorMap(d_norm, cv2.COLORMAP_MAGMA)
+                cv2.imshow('Depth', d_color)
 
-                # Use magma (red→orange→violet) like Lite-Mono examples
-                mapper_cm = cm.ScalarMappable(norm=mpl.colors.Normalize(vmin=0.0, vmax=1.0),
-                                            cmap='magma')
-                depth_color = mapper_cm.to_rgba(d_norm)[..., :3]  # drop alpha
-                depth_color = (depth_color * 255).astype(np.uint8)
-                depth_color_bgr = cv2.cvtColor(depth_color, cv2.COLOR_RGB2BGR)
+            map_vis = mapper.get_grid_for_viz()
+            cv2.imshow('Map', cv2.resize(map_vis, (400, 400), interpolation=cv2.INTER_NEAREST))
 
-                cv2.imshow('depth', depth_color_bgr)
+            flight_state_str = flight_controller.state if flight_controller and auto_flight else ""
+            draw_hud(frame, center_dist_m, DEPTH_SCALE, "TEST" if TEST_MODE else "FLY", flight_state_str)
+            cv2.imshow('Camera', frame)
 
-            mapper.process_frame_detections(
-                boxes,
-                image_width=frame.shape[1],
-                depth_map=depth,
-            )
-
-            # update mapper with detections (per-object)
-            mapper.process_frame_detections(
-                boxes,
-                image_width=frame.shape[1],
-                depth_map=depth,
-            )
-
-            # plan occasionally to a new frontier (demo behavior)
-            if loop % 50 == 0:
-                origin_cell = mapper.world_to_cell(mapper.x, mapper.y)
-                goal = (origin_cell[0] + 40, origin_cell[1])
-                grid = mapper.grid
-                path = astar(grid, origin_cell, goal)
-                plan = path
-                plan_index = 0
-
-            # ensure there's an initial plan shortly after takeoff
-            if not plan and loop > 1:
-                origin_cell = mapper.world_to_cell(mapper.x, mapper.y)
-                goal = (origin_cell[0] + 40, origin_cell[1])
-                plan = astar(mapper.grid, origin_cell, goal)
-                plan_index = 0
-
-            # draw map viz and scale up for visibility
-            vis = mapper.get_grid_for_viz()
-            vis_color = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
-            # scale to 600x600 for easy viewing
-            display_size = 600
-            vis_color_display = cv2.resize(vis_color, (display_size, display_size), interpolation=cv2.INTER_NEAREST)
-
-            # draw plan on vis, scaling cells to display pixels
-            if plan:
-                scale = display_size / float(vis.shape[1])
-                for cell in plan:
-                    px = int(cell[0] * scale)
-                    py = int(cell[1] * scale)
-                    cv2.circle(vis_color_display, (px, py), 2, (0, 0, 255), -1)
-
-            # overlay drone pos
-            dr_cell = mapper.world_to_cell(mapper.x, mapper.y)
-            px = int(dr_cell[0] * display_size / float(vis.shape[1]))
-            py = int(dr_cell[1] * display_size / float(vis.shape[0]))
-            cv2.circle(vis_color_display, (px, py), 5, (0, 255, 0), -1)
-
-            # ensure windows are created and resizable
-            cv2.namedWindow('map', cv2.WINDOW_NORMAL)
-            cv2.namedWindow('camera', cv2.WINDOW_NORMAL)
-            # draw a simple scale bar: 1 m
-            meters_for_bar = 1.0
-            pixels_per_cell = display_size / float(vis.shape[1])  # map cells → display pixels
-            cells_for_bar = int(meters_for_bar / mapper.resolution)
-            bar_pixels = int(cells_for_bar * pixels_per_cell)
-
-            bar_y = display_size - 20
-            bar_x1 = 20
-            bar_x2 = bar_x1 + bar_pixels
-            cv2.line(vis_color_display, (bar_x1, bar_y), (bar_x2, bar_y), (255, 255, 255), 2)
-            cv2.putText(vis_color_display, "1 m", (bar_x1, bar_y - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.imshow('map', vis_color_display)
-            cv2.imshow('camera', frame)
-
-
-            if USE_SIM and plan:
-                # Move the drone towards the next waypoint in 'plan'
-                if plan_index < len(plan):
-                    target_cell = plan[plan_index]
-                    wx, wy = mapper.cell_to_world(target_cell[0], target_cell[1])
-                    dx = wx - mapper.x
-                    dy = wy - mapper.y
-                    dist = (dx*dx + dy*dy) ** 0.5
-                    max_step = 0.05  # meters per command
-                    threshold = 0.03  # meters to consider reached
-
-                    if dist < threshold:
-                        plan_index += 1
-                    else:
-                        # Calculate direction
-                        fb = int(100 * min(max_step, dist) * np.sign(dx))  # Forward/backward
-                        lr = int(100 * min(max_step, dist) * np.sign(dy))  # Left/right
-                        ud = 0
-                        yv = 0
-                        # Cap values to Tello RC limits
-                        fb = max(-100, min(100, fb))
-                        lr = max(-100, min(100, lr))
-                        # Send a movement command for a short burst
-                        drone.send_rc_control(lr, fb, ud, yv)
-                        time.sleep(0.2)  # Short move, then stop
-                        drone.send_rc_control(0, 0, 0, 0)
-
-
-            key = cv2.waitKey(30) & 0xFF
-            # 'q' to quit, 'l' to land immediately
+            # 5. Inputs (Scale Tuning + Flight Control)
+            key = cv2.waitKey(10) & 0xFF
             if key == ord('q'):
-                print('q pressed: landing and exiting')
-                wait_for_landed(drone)
                 running = False
-                break
-            if key == ord('l'):
-                print('l pressed: landing now')
-                wait_for_landed(drone)
-                running = False
-                break
-            # regular check: if drone reports low height (landed) break main loop
-            if not USE_SIM and hasattr(drone, 'get_height'):
-                try:
-                    height = drone.get_height()
-                    if height is not None and int(height) <= 5:
-                        print('detected landed during normal loop, exiting')
-                        running = False
-                        break
-                except Exception:
-                    pass
+            elif key == ord(']'):
+                DEPTH_SCALE += 0.5
+            elif key == ord('['):
+                DEPTH_SCALE = max(0.5, DEPTH_SCALE - 0.5)
+            elif key == ord('a'):
+                # Toggle autonomous flight
+                if not USE_SIM and not TEST_MODE:
+                    auto_flight = not auto_flight
+                    if auto_flight and flight_controller is None:
+                        # Initialize flight controller on first activation
+                        flight_controller = FlightController(drone, mapper, sys.modules[__name__])
+                        print("Autonomous flight ENABLED")
+                    print(f"Auto flight: {'ON' if auto_flight else 'OFF'}")
 
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt received, stopping")
-        running = False
+            # 6. Autonomous Flight Control
+            if auto_flight and flight_controller and not USE_SIM and not TEST_MODE:
+                try:
+                    flight_controller.update(mapper.grid)
+                except Exception as e:
+                    print(f"Flight control error: {e}")
+                    auto_flight = False
+                    drone.land()
 
     finally:
-        print("shutting down: landing and cleaning up")
-        # ensure we attempt to land if still flying
-        try:
-            # DummyDrone has _landed flag; for Tello we call land and proceed
-            if getattr(drone, '_landed', False) is False:
-                print('attempting to land drone...')
-                drone.land()
-        except Exception as e:
-            print('error while landing:', e)
+        # SAVE SETTINGS AUTOMATICALLY
+        with open(CONFIG_FILE, "w") as f:
+            f.write(str(DEPTH_SCALE))
+        print(f"Scale {DEPTH_SCALE} saved to {CONFIG_FILE}.")
 
-    # stop frame thread and stream
-        if frame_read is not None:
+        if frame_reader:
+            frame_reader.stop()
+        
+        if not USE_SIM and not TEST_MODE:
             try:
-                frame_read.stop()
-            except Exception:
-                pass
-
-        if not USE_SIM:
+                drone.land()
+            except: pass
             try:
                 drone.streamoff()
-            except Exception:
-                pass
-
-        if cap is not None:
-            cap.release()
-
+            except: pass
+            
         cv2.destroyAllWindows()
-
 
 if __name__ == '__main__':
     main()

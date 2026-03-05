@@ -53,28 +53,93 @@ def astar(grid, start, goal, allow_diagonal=False):
     return []
 
 
-def find_frontier(grid, origin_cell, min_distance=10):
+def find_frontier(grid, origin_cell, min_distance=5, max_distance=None):
     """
     Find a frontier cell (boundary between known free and unknown areas) to explore.
-    Returns cell coordinates or None.
+    Grid convention: 0.0 = free, 1.0 = occupied, 0.5 = unknown.
+    
+    Args:
+        grid: Occupancy grid (0.0=free, 1.0=occupied, 0.5=unknown)
+        origin_cell: (x, y) current position in grid
+        min_distance: Minimum distance from origin to consider
+        max_distance: Maximum distance from origin (None=unlimited)
+    
+    Returns:
+        (x, y) frontier cell coordinates or None if none found
     """
     rows, cols = grid.shape
     sx, sy = origin_cell
     best = None
-    best_dist = -1
+    best_dist = float('inf')
+    
     for y in range(rows):
         for x in range(cols):
-            if grid[y, x] == 0:
-                # check neighbors for unknown
+            # Look for free cells
+            if grid[y, x] < 0.3:  # Free cell
+                # Check if any neighbor is unknown (0.4-0.6 range)
                 neigh_unknown = False
-                for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
-                    nx, ny = x+dx, y+dy
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = x + dx, y + dy
                     if 0 <= nx < cols and 0 <= ny < rows:
-                        if grid[ny, nx] == 0: # 0 is free, we use 128 for unknown? keep heuristic
-                            continue
-                # heuristic: pick the farthest free cell from origin to explore new areas
-                dist = abs(x - sx) + abs(y - sy)
-                if dist > best_dist and dist >= min_distance:
-                    best = (x, y)
-                    best_dist = dist
+                        if 0.4 <= grid[ny, nx] <= 0.6:
+                            neigh_unknown = True
+                            break
+                
+                if neigh_unknown:
+                    # This is a frontier cell (free next to unknown)
+                    dist = abs(x - sx) + abs(y - sy)
+                    if dist >= min_distance and (max_distance is None or dist <= max_distance):
+                        # Prefer nearest frontier for faster exploration
+                        if dist < best_dist:
+                            best = (x, y)
+                            best_dist = dist
+    
     return best
+
+
+def find_all_frontiers(grid, origin_cell, max_distance=None, limit=5):
+    """
+    Find multiple frontier cells for exploration options.
+    Returns list of (x, y, distance) tuples sorted by distance.
+    """
+    rows, cols = grid.shape
+    sx, sy = origin_cell
+    frontiers = []
+    
+    for y in range(rows):
+        for x in range(cols):
+            if grid[y, x] < 0.3:
+                neigh_unknown = False
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < cols and 0 <= ny < rows:
+                        if 0.4 <= grid[ny, nx] <= 0.6:
+                            neigh_unknown = True
+                            break
+                
+                if neigh_unknown:
+                    dist = abs(x - sx) + abs(y - sy)
+                    if max_distance is None or dist <= max_distance:
+                        frontiers.append((x, y, dist))
+    
+    # Sort by distance (nearest first) and return top N
+    frontiers.sort(key=lambda f: f[2])
+    return frontiers[:limit]
+
+
+def plan_path_to_target(grid, start, target, allow_diagonal=False):
+    """
+    Plan a path from start to target, handling obstacles.
+    
+    Args:
+        grid: Occupancy grid (0.0-1.0)
+        start: (x, y) start position
+        target: (x, y) target position
+        allow_diagonal: Whether to allow diagonal movement
+    
+    Returns:
+        List of (x, y) waypoints from start to target, or empty list if no path
+    """
+    # Convert to binary grid for A*: <0.5 is free, >=0.5 is obstacle
+    binary_grid = np.where(grid < 0.5, 0, 255).astype(np.uint8)
+    return astar(binary_grid, start, target, allow_diagonal=allow_diagonal)

@@ -1,6 +1,35 @@
-opencv-python
-numpy
-djitellopy
-pygame
-torch
-torchvision
+# Last updated: 2026-03-03
+
+# Computer Vision & Image Processing
+opencv-python==4.8.1.78
+Pillow==10.0.0
+
+# Computing
+numpy==1.24.3
+matplotlib==3.7.2
+
+# Lite-Mono depth estimation
+torch==2.0.1
+torchvision==0.15.2
+
+# Drone Control - DJI Tello SDK
+djitellopy==2.4.0
+
+# UI Extensions (optional)
+pygame==2.1.2
+
+# Data Logging (optional)
+pandas==2.0.3
+
+# Standard libs, no install needed:
+#   - argparse (stdlib)
+#   - glob (stdlib)
+#   - cv2 (included in opencv-python)
+#   - heapq (stdlib)
+#   - time (stdlib)
+#   - threading (stdlib)
+
+# NOTE: Local modules (do NOT install from PyPI):
+#   - networks: Custom networks in ./networks/
+#   - layers: Custom layers in ./Lite-Mono/layers.py
+#   These are included in the repository and imported directly.
