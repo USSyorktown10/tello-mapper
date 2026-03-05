@@ -8,7 +8,6 @@ from planner import find_frontier, plan_path_to_target, find_all_frontiers
 import torch
 import os
 
-# --- CONFIGURATION ---
 USE_SIM = True          # False = Real Tello
 TEST_MODE = False         # True = Camera ON, Motors OFF (Good for tuning)
 
@@ -36,7 +35,7 @@ if LITEMONO_DIR not in sys.path:
 import networks
 from layers import disp_to_depth
 
-# --- CUSTOM VIDEO READER (Bypasses 'av' library) ---
+# vid reader
 class BackgroundFrameRead:
     """
     Reads frames from Tello UDP stream using OpenCV directly.
@@ -220,7 +219,7 @@ def main():
     cap = None          # For Webcam
     frame_reader = None # For Tello
 
-    # --- DRONE SETUP ---
+    # Setup
     if USE_SIM:
         drone = DummyDrone()
         cap = cv2.VideoCapture(0)
@@ -240,7 +239,7 @@ def main():
             print(f"Connection Error: {e}")
             return
 
-    # --- SAFETY CHECK ---
+    # Saftey
     if not TEST_MODE and not USE_SIM:
         print("Taking off in 3 seconds...")
         time.sleep(3)
@@ -248,7 +247,7 @@ def main():
     else:
         print("TEST MODE: Motors disabled. Running camera & AI only.")
 
-    # --- AI SETUP ---
+    # Check for GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weights_folder = os.path.join(ROOT, "weights", "lite-mono-small-640x192")
     encoder_path = os.path.join(weights_folder, "encoder.pth")
@@ -262,7 +261,7 @@ def main():
     depth_decoder.load_state_dict({k: v for k, v in torch.load(decoder_path, map_location=device).items() if k in depth_decoder.state_dict()})
     depth_decoder.to(device).eval()
 
-    # --- MAIN LOOP ---
+    # Main
     running = True
     frame_count = 0
     prev_depth = None
@@ -273,7 +272,7 @@ def main():
 
     try:
         while running:
-            # 1. Get Frame
+            # Get Frame
             frame = None
             if USE_SIM:
                 ret, frame = cap.read()
@@ -284,7 +283,7 @@ def main():
                     continue
                 frame = frame_reader.frame.copy()
 
-            # 2. Crop & Resize (Correcting Aspect Ratio)
+            # Crop & Resize (Correcting Aspect Ratio)
             orig_h, orig_w = frame.shape[:2]
             target_aspect = 320 / 96
             crop_h = int(orig_w / target_aspect)
@@ -298,7 +297,7 @@ def main():
             frame_count += 1
             center_dist_m = None
 
-            # 3. Inference
+            # Inference
             if frame_count % DEPTH_EVERY_N == 0:
                 with torch.no_grad():
                     features = encoder(input_tensor)
@@ -321,7 +320,7 @@ def main():
                 if mid_patch.size > 0:
                     center_dist_m = np.median(mid_patch)
 
-            # 4. Visualization
+            # Visualization
             if depth is not None:
                 d_vis = np.clip(depth, 0.0, 5.0)
                 d_norm = (d_vis / 5.0 * 255).astype(np.uint8)
@@ -335,7 +334,7 @@ def main():
             draw_hud(frame, center_dist_m, DEPTH_SCALE, "TEST" if TEST_MODE else "FLY", flight_state_str)
             cv2.imshow('Camera', frame)
 
-            # 5. Inputs (Scale Tuning + Flight Control)
+            # nputs (Scale Tuning + Flight Control)
             key = cv2.waitKey(10) & 0xFF
             if key == ord('q'):
                 running = False
@@ -353,7 +352,7 @@ def main():
                         print("Autonomous flight ENABLED")
                     print(f"Auto flight: {'ON' if auto_flight else 'OFF'}")
 
-            # 6. Autonomous Flight Control
+            # Autonomous Flight Control
             if auto_flight and flight_controller and not USE_SIM and not TEST_MODE:
                 try:
                     flight_controller.update(mapper.grid)
@@ -363,7 +362,7 @@ def main():
                     drone.land()
 
     finally:
-        # SAVE SETTINGS AUTOMATICALLY
+        # Save the settings
         with open(CONFIG_FILE, "w") as f:
             f.write(str(DEPTH_SCALE))
         print(f"Scale {DEPTH_SCALE} saved to {CONFIG_FILE}.")

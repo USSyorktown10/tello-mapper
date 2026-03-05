@@ -326,15 +326,6 @@ if auto_flight and flight_controller:
 
 See LICENSE file in repository.
 
-
-
-
-
-
-
-
-
-
-
+Note that by using this software, you agree to the terms and conditions outlined in the LICENSE file. License is BSD-3. When you use this software, you are agreeing to abide by these terms, including liability for any damages caused by your use of the software.
 
 YOLOOOOOOOOOO (yolov3 reference)

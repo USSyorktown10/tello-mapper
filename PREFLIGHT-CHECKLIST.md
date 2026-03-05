@@ -13,7 +13,7 @@ pip install -r requirements.txt
 Verify all packages installed (torch, opencv, djitellopy, numpy, matplotlib, Pillow)
 
 ### 2. Model Weights Present
-Verify these files exist:
+Verify these files exist: (They should come with the repository)
 ```
 weights/lite-mono-small-640x192/encoder.pth
 weights/lite-mono-small-640x192/depth.pth
@@ -27,6 +27,11 @@ yolov3.cfg
 yolov3.weights
 depth_config.txt (created after first run)
 ```
+
+Note: This repo dosent come with yolov3.weights, as its too big of a file to include. You must download it separately.
+[Download yolov3.weights](https://pjreddie.com/media/files/yolov3.weights)
+
+After downloading, move `yolov3.weights` to the base tello-mapper directory. (Dont store under any folder in this directory. Example path: `/Users/USSyorktown10/Code/tello-mapper/yolov3.weights`)
 
 ---
 

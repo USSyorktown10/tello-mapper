@@ -4,7 +4,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 
-# --- Configuration ---
 LOWER_COLOR_BOUND = (0, 0, 100)
 UPPER_COLOR_BOUND = (100, 100, 255) 
 MIN_AREA_THRESHOLD = 5000 
@@ -14,7 +13,6 @@ grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=int)  # occupancy grid
 drone_pos = [GRID_SIZE//2, GRID_SIZE//2]
 drone_yaw = 0
 
-# --- Tello Initialization ---
 tello = Tello()
 tello.connect()
 print(f"Battery: {tello.get_battery()}%")

@@ -79,8 +79,7 @@ class Mapper:
         h, w = depth_map.shape
         cx_img = w / 2.0
         
-        # HEURISTIC: Ignore Top 15% (Ceiling/Lights) and Bottom 30% (Floor)
-        # This prevents mapping the ground as a wall.
+        # HEURISTIC: Ignore Top 15% (Ceiling/Lights) and Bottom 30% (Floor) dont map ground as a wall
         y_start = int(h * 0.15)
         y_end = int(h * 0.70) 
 
@@ -93,8 +92,6 @@ class Mapper:
                     continue
 
                 # Calculate Bearing
-                # We map x-pixel to angle. 
-                # (xx - cx_img) gives pixels from center.
                 bearing_deg = (xx - cx_img) / cx_img * (camera_fov_deg / 2.0)
                 bearing_rad = np.deg2rad(bearing_deg) + self.theta
 
@@ -108,10 +105,8 @@ class Mapper:
 
     def get_grid_for_viz(self):
         # Threshold: >0.6 is occupied (Black), <0.6 is free (White)
-        # Unknown (0.5) will be greyish or treated as free here for clarity
         vis = np.zeros((self.cells, self.cells), dtype=np.uint8)
         
         # 0 = Obstacle (Black), 255 = Free (White)
-        # Scale 0.0-1.0 to 0-255 inverted
         vis = (255 * (1.0 - self.grid)).astype(np.uint8)
         return vis

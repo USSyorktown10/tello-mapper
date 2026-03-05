@@ -41,7 +41,7 @@ FOCAL_LENGTH = 700  # Example: pixels (replace with your value from calibration)
 KNOWN_WIDTHS = {
     "person": 0.45,  # meters (average human shoulder width)
     "car": 1.8,      # meters (average car width)
-    # Add more classes and widths as appropriate
+    # Add more classes and widths as appropriate. Im too lazy for that
 }
 
 print('press q to quit')
